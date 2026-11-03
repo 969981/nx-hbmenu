@@ -1,0 +1,168 @@
+name: Sync upstream and build hbmenu
+
+on:
+  schedule:
+    - cron: "*/10 * * * *"
+  workflow_dispatch:
+  push:
+    branches: [cmakeify]
+    paths:
+      - ".github/workflows/sync-build-release.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: nx-hbmenu-upstream-release
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    name: Check and fast-forward upstream master
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    outputs:
+      sha: ${{ steps.detect.outputs.sha }}
+      version: ${{ steps.detect.outputs.version }}
+      tag: ${{ steps.detect.outputs.tag }}
+      build: ${{ steps.detect.outputs.build }}
+    steps:
+      - name: Check out automation branch
+        uses: actions/checkout@v4
+        with:
+          ref: cmakeify
+          fetch-depth: 0
+
+      - name: Sync upstream master and detect new release
+        id: detect
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          git remote add upstream https://github.com/switchbrew/nx-hbmenu.git
+          git fetch --no-tags upstream +refs/heads/master:refs/remotes/upstream/master
+          UP_SHA="$(git rev-parse refs/remotes/upstream/master)"
+          LOCAL_SHA="$(git ls-remote origin refs/heads/master | cut -f1)"
+          if [[ -n "$LOCAL_SHA" && "$LOCAL_SHA" != "$UP_SHA" ]]; then
+            git fetch --no-tags origin master
+            if ! git merge-base --is-ancestor "$LOCAL_SHA" "$UP_SHA"; then
+              echo "::error::Local master diverged from switchbrew/master. Refusing to overwrite local commits."
+              exit 1
+            fi
+          fi
+          if [[ "$LOCAL_SHA" != "$UP_SHA" ]]; then
+            git push origin "$UP_SHA:refs/heads/master"
+            echo "Fast-forwarded master to upstream $UP_SHA"
+          else
+            echo "master is already in sync"
+          fi
+
+          VERSION="$(git show "${UP_SHA}:Makefile" | sed -nE 's/^export APP_VERSION[[:space:]]*:=[[:space:]]*([0-9]+(\.[0-9]+)*).*/\1/p' | head -n 1)"
+          if [[ -z "$VERSION" ]]; then
+            echo "::error::Cannot determine upstream APP_VERSION"
+            exit 1
+          fi
+          SHORT_SHA="${UP_SHA:0:12}"
+          TAG="v${VERSION}-auto.${SHORT_SHA}"
+          echo "sha=$UP_SHA" >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "build=false" >> "$GITHUB_OUTPUT"
+            echo "Release $TAG already exists; skipping rebuild"
+          else
+            echo "build=true" >> "$GITHUB_OUTPUT"
+            echo "Release $TAG missing; build required"
+          fi
+
+  build:
+    name: Compile Nintendo Switch NRO
+    needs: sync
+    if: needs.sync.outputs.build == 'true'
+    runs-on: ubuntu-latest
+    container:
+      image: devkitpro/devkita64:20260219
+    permissions:
+      contents: read
+    steps:
+      - name: Check out exact upstream revision
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.sync.outputs.sha }}
+          persist-credentials: false
+
+      - name: Build hbmenu.nro with devkitPro
+        shell: bash
+        run: |
+          set -euo pipefail
+          export DEVKITPRO=/opt/devkitpro
+          export DEVKITA64=/opt/devkitpro/devkitA64
+          export PATH="$DEVKITA64/bin:$DEVKITPRO/tools/bin:$PATH"
+          test -f "$DEVKITPRO/libnx/switch_rules"
+          command -v aarch64-none-elf-gcc
+          command -v zip
+          make -j2 nx RELEASE=1
+          test -s nx-hbmenu.nro
+          mkdir -p dist
+          cp nx-hbmenu.nro dist/hbmenu.nro
+          (cd dist && zip -9 hbmenu.zip hbmenu.nro)
+          (cd dist && sha256sum hbmenu.nro hbmenu.zip > SHA256SUMS)
+
+      - name: Upload release files
+        uses: actions/upload-artifact@v4
+        with:
+          name: hbmenu-release
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 7
+
+  release:
+    name: Publish GitHub Release
+    needs: [sync, build]
+    if: needs.sync.outputs.build == 'true' && needs.build.result == 'success'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download compiled assets
+        uses: actions/download-artifact@v4
+        with:
+          name: hbmenu-release
+          path: dist
+
+      - name: Create or repair release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.sync.outputs.tag }}
+          UPSTREAM_SHA: ${{ needs.sync.outputs.sha }}
+          UPSTREAM_VERSION: ${{ needs.sync.outputs.version }}
+        run: |
+          set -euo pipefail
+          test -s dist/hbmenu.nro
+          test -s dist/hbmenu.zip
+          test -s dist/SHA256SUMS
+          cat > release-notes.md <<EOF
+          Built automatically from [switchbrew/nx-hbmenu](https://github.com/switchbrew/nx-hbmenu) master.
+
+          - Upstream version: v${UPSTREAM_VERSION}
+          - Upstream commit: [${UPSTREAM_SHA}](https://github.com/switchbrew/nx-hbmenu/commit/${UPSTREAM_SHA})
+          - Toolchain: devkitpro/devkita64:20260219
+          - Installation: copy `hbmenu.nro` to the root of the Switch SD card (or follow your homebrew loader's instructions).
+          - Assets: standalone NRO, ZIP, SHA256SUMS.
+
+          This is an independently built release, not an official switchbrew binary.
+          EOF
+          if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$RELEASE_TAG" dist/hbmenu.nro dist/hbmenu.zip dist/SHA256SUMS --clobber --repo "$GITHUB_REPOSITORY"
+          else
+            gh release create "$RELEASE_TAG" dist/hbmenu.nro dist/hbmenu.zip dist/SHA256SUMS \
+              --repo "$GITHUB_REPOSITORY" \
+              --target "$UPSTREAM_SHA" \
+              --title "nx-hbmenu v${UPSTREAM_VERSION} (auto ${UPSTREAM_SHA:0:12})" \
+              --notes-file release-notes.md \
+              --latest
+          fi
